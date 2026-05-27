@@ -1,7 +1,9 @@
 # 开发手册 — 页内存池内部机制
 
+[中文](dev_manual.md) | [English](../en/dev_manual.md) | [← 返回 README](../../README_zh.md)
+
 > 版本: 1.0 | 日期: 2026-05-20
-> 对应源码: include/pool.h (333行) + src/pool.c (649行)
+> 对应源码: include/pool.h (~340行) + src/pool.c (~740行)
 
 ---
 

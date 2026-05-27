@@ -1,5 +1,7 @@
 # User Manual — Page-based Memory Pool
 
+[English](user_manual.md) | [中文](../zh/user_manual.md) | [← Back to README](../../README.md)
+
 > Version: 2.0 | Date: 2026-05-20
 
 ## 1. Overview

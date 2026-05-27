@@ -1,29 +1,51 @@
-# Page-based Memory Pool (页内存池)
+# Page-based Memory Pool
 
-A page-based memory management system designed for MCU (microcontrollers).
+[English](README.md) | [中文](README_zh.md)
+
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![C99](https://img.shields.io/badge/C-C99-blue)]()
+[![Tests](https://img.shields.io/badge/tests-29%20passed-brightgreen)]()
+
+A page-based memory management system designed for embedded MCUs. C99 pure standard — zero system calls, all memory user-provided.
 
 ## Features
 
-- **C99 pure standard**: no system calls, suitable for bare-metal environments
-- **Dual-region memory model**: metadata and user data are completely separated, user data contains no management information
-- **Handle system**: handle = generation + index, safe reuse, prevents use-after-free
-- **Ownership isolation**: 0~127 system IDs (manual), 128~25565 user IDs (auto)
-- **Full API**: allocate, lock/unlock, free, resize, defrag
+- **C99 only** — no system calls, suitable for bare-metal environments
+- **Dual-region memory model** — metadata and user data physically separated; data region contains zero management overhead
+- **Handle system** — opaque 32-bit handles with generation-based use-after-free protection
+- **Ownership isolation** — 0–127 system IDs (manual), 128–25565 user IDs (auto-assigned)
+- **Full API** — allocate, lock/unlock, free, resize, defrag, free_all
+
+## Documentation
+
+| Document | Language |
+|----------|----------|
+| [User Manual](doc/en/user_manual.md) | EN / [中文](doc/zh/user_manual.md) |
+| [Development Manual](doc/en/dev_manual.md) | EN / [中文](doc/zh/dev_manual.md) |
+
+- **User Manual** — Quick start, API reference, parameter selection guide, error codes
+- **Development Manual** — Internal architecture, metadata layout, handle encoding, core algorithms, optimizations
 
 ## Project Structure
 
 ```
 ├── CMakeLists.txt          — CMake build entry
-├── .gitignore              — excludes build/
 ├── include/
-│   └── pool.h              — public API header
+│   └── pool.h              — public API header (~340 lines)
 ├── src/
-│   └── pool.c              — implementation
+│   └── pool.c              — implementation (~740 lines)
 ├── test/
-│   ├── test_pool.c         — 29 unit tests (optional POOL_DEBUG)
-│   └── CMakeLists.txt      — test subdirectory
-├── .tmp/                   — project memory files
-└── build/                  — build artifacts (git ignored)
+│   ├── test_pool.c         — 29 unit tests
+│   └── CMakeLists.txt
+├── doc/
+│   ├── en/                 — English manuals
+│   │   ├── user_manual.md
+│   │   └── dev_manual.md
+│   └── zh/                 — Chinese manuals
+│       ├── user_manual.md
+│       └── dev_manual.md
+├── LICENSE
+└── .gitignore
 ```
 
 ## Quick Start
@@ -35,8 +57,8 @@ A page-based memory management system designed for MCU (microcontrollers).
 #define PAGE_SIZE    256
 #define PAGE_COUNT   64
 #define HANDLE_COUNT 16
-uint8_t meta[POOL_META_SIZE(PAGE_COUNT, HANDLE_COUNT)];
-uint8_t data[PAGE_SIZE * PAGE_COUNT];
+static uint8_t meta[POOL_META_SIZE(PAGE_COUNT, HANDLE_COUNT)];
+static uint32_t data[PAGE_SIZE / 4 * PAGE_COUNT];  // uint32_t for alignment
 
 // 2. Initialize pool
 pool_cfg_t cfg;
@@ -65,42 +87,35 @@ pool_free(&owner, handle);
 
 ## Build
 
-Requires cmake + a C99 compiler (e.g. gcc).
-
-### Mode 1: Static library only (default)
+Requires CMake ≥ 3.10 and a C99 compiler (GCC, Clang, etc.).
 
 ```sh
+# Library only
 cmake -B build
 cmake --build build
-# output: build/libpool.a
-```
+# Output: build/libpool.a
 
-### Mode 2: Library + tests
-
-```sh
+# Library + tests
 cmake -B build -DPOOL_BUILD_TEST=ON
 cmake --build build
 ctest --test-dir build
 ```
 
-Tests are compiled with `POOL_DEBUG`, which enables hexdump output of bitmap,
-page_owner map, handle table, and data window.
-
-### Clean
-
-```sh
-rm -rf build
-```
-
-## Integration into Other Projects
-
-In your project's `CMakeLists.txt`:
+## Integration (CMake)
 
 ```cmake
-add_subdirectory(path/to/pool)
+add_subdirectory(path/to/MemoryPool)
 target_link_libraries(your_target PRIVATE pool)
-target_include_directories(your_target PRIVATE path/to/pool/include)
+target_include_directories(your_target PRIVATE path/to/MemoryPool/include)
 ```
+
+## Key Design Decisions
+
+- **All memory is user-provided** — no `malloc`, no dynamic allocation
+- **Handles never expose addresses until locked** — enables safe relocation during defrag
+- **Generation counters prevent use-after-free** — freed handles are permanently invalidated
+- **Locking protects against relocation** — `pool_defrag` skips locked handles
+- **data_move is overridable** — define `data_move` macro before `#include "pool.c"` for platform-specific copy
 
 ## License
 

@@ -1,7 +1,9 @@
 # Development Manual — Page-based Memory Pool Internals
 
+[English](dev_manual.md) | [中文](../zh/dev_manual.md) | [← Back to README](../../README.md)
+
 > Version: 2.0 | Date: 2026-05-20
-> Source: include/pool.h (~340 lines) + src/pool.c (~780 lines)
+> Source: include/pool.h (~340 lines) + src/pool.c (~740 lines)
 
 ---
 

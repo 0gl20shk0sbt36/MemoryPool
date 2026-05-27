@@ -1,5 +1,7 @@
 # 用户手册 — 页内存池
 
+[中文](user_manual.md) | [English](../en/user_manual.md) | [← 返回 README](../../README_zh.md)
+
 > 版本: 2.0 | 日期: 2026-05-20
 
 ## 1. 概述

@@ -9,27 +9,28 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <string.h>
 
 /*===========================================================================
  * 内部工具函数
  *===========================================================================*/
 
-/** @brief 位操作：测试指定位 */
-static bool bitmap_test(const uint8_t *bitmap, uint32_t page)
+/** @brief 位操作：测试指定位（内联，热路径） */
+static inline bool bitmap_test(const uint8_t *bitmap, uint32_t page)
 {
-    return (bitmap[page / 8u] & (uint8_t)(1u << (page % 8u))) != 0;
+    return (bitmap[page >> 3u] & (uint8_t)(1u << (page & 7u))) != 0;
 }
 
-/** @brief 位操作：设置指定位 */
-static void bitmap_set(uint8_t *bitmap, uint32_t page)
+/** @brief 位操作：设置指定位（内联，热路径） */
+static inline void bitmap_set(uint8_t *bitmap, uint32_t page)
 {
-    bitmap[page / 8u] |= (uint8_t)(1u << (page % 8u));
+    bitmap[page >> 3u] |= (uint8_t)(1u << (page & 7u));
 }
 
-/** @brief 位操作：清除指定位 */
-static void bitmap_clear(uint8_t *bitmap, uint32_t page)
+/** @brief 位操作：清除指定位（内联，热路径） */
+static inline void bitmap_clear(uint8_t *bitmap, uint32_t page)
 {
-    bitmap[page / 8u] &= (uint8_t)(~(1u << (page % 8u)));
+    bitmap[page >> 3u] &= (uint8_t)(~(1u << (page & 7u)));
 }
 
 /**
@@ -47,14 +48,14 @@ static void pages_mark(pool_cfg_t *cfg, uint32_t start, uint32_t count, uint16_t
 
     /* 阶段1: 从 start 对齐到字节边界 */
     while (p < end && (p & 7u) != 0) {
-        bm[p / 8u] |= (uint8_t)(1u << (p % 8u));
+        bm[p >> 3u] |= (uint8_t)(1u << (p & 7u));
         cfg->page_owner[p] = handle_idx;
         p++;
     }
 
     /* 阶段2: 整字节批量操作（位图写 0xFF + page_owner 循环） */
     while (p + 8u <= end) {
-        bm[p / 8u] = 0xFFu;
+        bm[p >> 3u] = 0xFFu;
         cfg->page_owner[p + 0] = handle_idx;
         cfg->page_owner[p + 1] = handle_idx;
         cfg->page_owner[p + 2] = handle_idx;
@@ -68,7 +69,7 @@ static void pages_mark(pool_cfg_t *cfg, uint32_t start, uint32_t count, uint16_t
 
     /* 阶段3: 尾部不足一字节，逐位处理 */
     while (p < end) {
-        bm[p / 8u] |= (uint8_t)(1u << (p % 8u));
+        bm[p >> 3u] |= (uint8_t)(1u << (p & 7u));
         cfg->page_owner[p] = handle_idx;
         p++;
     }
@@ -88,14 +89,14 @@ static void pages_unmark(pool_cfg_t *cfg, uint32_t start, uint32_t count)
 
     /* 阶段1: 从 start 对齐到字节边界 */
     while (p < end && (p & 7u) != 0) {
-        bm[p / 8u] &= (uint8_t)(~(1u << (p % 8u)));
+        bm[p >> 3u] &= (uint8_t)(~(1u << (p & 7u)));
         cfg->page_owner[p] = POOL_PAGE_FREE;
         p++;
     }
 
     /* 阶段2: 整字节批量清空（位图写 0x00 + page_owner 循环） */
     while (p + 8u <= end) {
-        bm[p / 8u] = 0x00u;
+        bm[p >> 3u] = 0x00u;
         cfg->page_owner[p + 0] = POOL_PAGE_FREE;
         cfg->page_owner[p + 1] = POOL_PAGE_FREE;
         cfg->page_owner[p + 2] = POOL_PAGE_FREE;
@@ -109,59 +110,29 @@ static void pages_unmark(pool_cfg_t *cfg, uint32_t start, uint32_t count)
 
     /* 阶段3: 尾部不足一字节，逐位处理 */
     while (p < end) {
-        bm[p / 8u] &= (uint8_t)(~(1u << (p % 8u)));
+        bm[p >> 3u] &= (uint8_t)(~(1u << (p & 7u)));
         cfg->page_owner[p] = POOL_PAGE_FREE;
         p++;
     }
 }
 
 /**
- * @brief 在数据空间中移动页数据（处理重叠）
- * @param cfg       池配置
- * @param src_page  源起始页
- * @param dst_page  目标起始页
- * @param count     页数
+ * @brief 在数据空间中移动页数据
+ *
+ * 默认使用 memmove。若用户已定义 data_move 宏（例如针对特定硬件的优化实现），
+ * 则使用用户的定义。宏签名: data_move(cfg, src_page, dst_page, count)
  */
-static void data_move(pool_cfg_t *cfg, uint32_t src_page, uint32_t dst_page, uint32_t count)
-{
-    if (count == 0 || src_page == dst_page) return;
-
-    uint8_t  *data    = (uint8_t *)cfg->data_base;
-    size_t    src_off = (size_t)src_page * cfg->page_size;
-    size_t    dst_off = (size_t)dst_page * cfg->page_size;
-    size_t    bytes   = (size_t)count * cfg->page_size;
-    uintptr_t src_a   = (uintptr_t)(data + src_off);
-    uintptr_t dst_a   = (uintptr_t)(data + dst_off);
-
-    /* 尝试 4 字节对齐的按字复制 */
-    if (bytes >= 4u && ((src_a | dst_a) & 3u) == 0u) {
-        uint32_t *s = (uint32_t *)(data + src_off);
-        uint32_t *d = (uint32_t *)(data + dst_off);
-        size_t words = bytes / 4u;
-
-        if (dst_off < src_off) {
-            for (size_t i = 0; i < words; i++) d[i] = s[i];
-        } else {
-            for (size_t i = words; i > 0; i--) d[i - 1] = s[i - 1];
-        }
-
-        /* 如有剩余字节（bytes % 4），退回逐字节处理 */
-        bytes  &= 3u;
-        src_off += words * 4u;
-        dst_off += words * 4u;
-    }
-    /* else: 未对齐，回退到逐字节复制 */
-
-    if (bytes == 0) return;
-
-    if (dst_off < src_off) {
-        for (size_t i = 0; i < bytes; i++)
-            data[dst_off + i] = data[src_off + i];
-    } else {
-        for (size_t i = bytes; i > 0; i--)
-            data[dst_off + i - 1] = data[src_off + i - 1];
-    }
-}
+#ifndef data_move
+#define data_move(cfg, src_page, dst_page, count) \
+    do { \
+        if ((count) != 0 && (src_page) != (dst_page)) { \
+            uint8_t *_d = (uint8_t *)(cfg)->data_base; \
+            memmove(_d + (size_t)(dst_page) * (cfg)->page_size,  \
+                    _d + (size_t)(src_page) * (cfg)->page_size,  \
+                    (size_t)(count) * (cfg)->page_size);         \
+        } \
+    } while(0)
+#endif
 
 /**
  * @brief 查找连续的 size 个空闲页（首次适配）
@@ -176,7 +147,7 @@ static int32_t pages_find_free(const pool_cfg_t *cfg, uint32_t count)
 
     for (uint32_t i = 0; i < cfg->page_count; i++) {
         /* 字节级加速：整字节全为 1 → 8 页全部已用，跳过 */
-        if ((i & 7u) == 0 && cfg->bitmap[i / 8u] == 0xFFu) {
+        if ((i & 7u) == 0 && cfg->bitmap[i >> 3u] == 0xFFu) {
             i += 7u;        /* +7，循环末尾 i++ = +8 */
             run_len = 0;
             continue;
@@ -336,12 +307,7 @@ pool_init_err_t pool_init(pool_cfg_t *cfg,
     cfg->handle_index_mask = ((uint32_t)1u << bits) - 1u;
 
     /* 初始化全部元数据为零 */
-    {
-        uint8_t *p = (uint8_t *)metadata_base;
-        for (size_t i = 0; i < required; i++) {
-            p[i] = 0;
-        }
-    }
+    memset(metadata_base, 0, required);
 
     /* 写入初始化标记（防重复 init） */
     *(uint32_t *)metadata_base = POOL_INIT_MAGIC;
