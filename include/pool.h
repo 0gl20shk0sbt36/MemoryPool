@@ -206,6 +206,14 @@ typedef enum {
     POOL_FREE_ALL_ERR_LOCKED    = 2,    /**< 非强制模式下存在被锁定的句柄 */
 } pool_free_all_err_t;
 
+/** pool_query_* 查询 API 错误码 */
+typedef enum {
+    POOL_QUERY_OK               = 0,
+    POOL_QUERY_ERR_NULL         = 1,    /**< owner/out 指针为 NULL */
+    POOL_QUERY_ERR_INVALID      = 2,    /**< 句柄无效 */
+    POOL_QUERY_ERR_OWNER        = 3,    /**< 句柄不属于此使用者 */
+} pool_query_err_t;
+
 /*===========================================================================
  * API 函数声明
  *===========================================================================*/
@@ -284,6 +292,10 @@ pool_alloc_err_t pool_alloc_bytes(pool_owner_t *owner, uint32_t bytes, uint32_t 
 /**
  * @brief 锁定句柄，递增锁定计数，返回数据地址
  *
+ * 支持可重入锁定：同一句柄可以被同一（或不同）使用者多次锁定，
+ * 每次锁定递增 lock_count，每次解锁递减。lock_count 回到 0 后方可释放。
+ * 锁定计数上限为 65535，溢出时返回 POOL_LOCK_ERR_OVERFLOW。
+ *
  * @param owner    [in]  使用者上下文
  * @param handle   [in]  句柄
  * @param addr_out [out] 返回的数据空间地址
@@ -328,7 +340,10 @@ pool_resize_err_t pool_resize(pool_owner_t *owner, uint32_t handle, uint32_t new
  * 从前往后扫描，将未锁定的句柄向低地址方向移动，消除碎片。
  * 锁定中的句柄不会被移动。
  *
- * @param owner [in] 使用者上下文
+ * **注意**：此函数操作的是整个池（所有使用者），owner 参数仅用于获取
+ * cfg 指针。传入任意有效的 pool_owner_t 均可，不影响操作范围。
+ *
+ * @param owner [in] 使用者上下文（仅用于访问 cfg，不影响操作范围）
  * @return POOL_DEFRAG_OK 或相应错误码
  */
 pool_defrag_err_t pool_defrag(pool_owner_t *owner);
@@ -341,6 +356,45 @@ pool_defrag_err_t pool_defrag(pool_owner_t *owner);
  * @return POOL_FREE_ALL_OK 或相应错误码
  */
 pool_free_all_err_t pool_free_all(pool_owner_t *owner, bool forced);
+
+/*===========================================================================
+ * 查询 API（只读，不修改池状态）
+ *===========================================================================*/
+
+/**
+ * @brief 查询池中当前空闲页数
+ *
+ * @param owner    [in]  使用者上下文（仅用于访问 cfg，任意有效 owner 均可）
+ * @param out_free [out] 返回的空闲页数
+ * @return POOL_QUERY_OK 或相应错误码
+ */
+pool_query_err_t pool_query_free_pages(pool_owner_t *owner, uint32_t *out_free);
+
+/**
+ * @brief 查询指定句柄占用的页数和字节数
+ *
+ * 注意：此函数需要句柄属于当前使用者（校验 owner_id）。
+ *
+ * @param owner       [in]  使用者上下文
+ * @param handle      [in]  句柄
+ * @param out_pages   [out] 返回占用的页数（可为 NULL，不关心则传 NULL）
+ * @param out_bytes   [out] 返回占用的字节数（可为 NULL）
+ * @return POOL_QUERY_OK 或相应错误码
+ */
+pool_query_err_t pool_query_handle_size(pool_owner_t *owner, uint32_t handle,
+                                         uint32_t *out_pages, uint32_t *out_bytes);
+
+/**
+ * @brief 查询某使用者占用的资源统计
+ *
+ * @param owner         [in]  使用者上下文（仅用于访问 cfg，任意有效 owner 均可）
+ * @param target_owner  [in]  要查询的使用者 ID
+ * @param out_handles   [out] 返回该使用者的活跃句柄数（可为 NULL）
+ * @param out_pages     [out] 返回该使用者占用的总页数（可为 NULL）
+ * @return POOL_QUERY_OK 或相应错误码
+ */
+pool_query_err_t pool_query_owner_info(pool_owner_t *owner, uint16_t target_owner,
+                                        uint32_t *out_handles, uint32_t *out_pages);
 
 #ifdef __cplusplus
 }

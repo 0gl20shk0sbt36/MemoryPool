@@ -742,3 +742,59 @@ pool_free_all_err_t pool_free_all(pool_owner_t *owner, bool forced)
 
     return POOL_FREE_ALL_OK;
 }
+
+/*===========================================================================
+ * 查询 API 实现（只读，不修改池状态）
+ *===========================================================================*/
+
+pool_query_err_t pool_query_free_pages(pool_owner_t *owner, uint32_t *out_free)
+{
+    if (owner == NULL || out_free == NULL) return POOL_QUERY_ERR_NULL;
+    pool_cfg_t *cfg = owner->cfg;
+
+    uint32_t free_count = 0;
+    for (uint32_t i = 0; i < cfg->page_count; i++) {
+        if (!bitmap_test(cfg->bitmap, i)) {
+            free_count++;
+        }
+    }
+    *out_free = free_count;
+    return POOL_QUERY_OK;
+}
+
+pool_query_err_t pool_query_handle_size(pool_owner_t *owner, uint32_t handle,
+                                         uint32_t *out_pages, uint32_t *out_bytes)
+{
+    if (owner == NULL) return POOL_QUERY_ERR_NULL;
+    pool_cfg_t *cfg = owner->cfg;
+
+    pool_handle_entry_t *e = handle_lookup(cfg, handle);
+    if (e == NULL)                    return POOL_QUERY_ERR_INVALID;
+    if (e->owner_id != owner->owner_id) return POOL_QUERY_ERR_OWNER;
+
+    if (out_pages != NULL) *out_pages = e->page_count;
+    if (out_bytes != NULL) *out_bytes = e->page_count * cfg->page_size;
+    return POOL_QUERY_OK;
+}
+
+pool_query_err_t pool_query_owner_info(pool_owner_t *owner, uint16_t target_owner,
+                                        uint32_t *out_handles, uint32_t *out_pages)
+{
+    if (owner == NULL) return POOL_QUERY_ERR_NULL;
+    pool_cfg_t *cfg = owner->cfg;
+
+    uint32_t handle_cnt = 0;
+    uint32_t page_cnt   = 0;
+
+    for (uint32_t i = 0; i < cfg->handle_count; i++) {
+        const pool_handle_entry_t *e = &cfg->handle_table[i];
+        if (e->owner_id == target_owner) {
+            handle_cnt++;
+            page_cnt += e->page_count;
+        }
+    }
+
+    if (out_handles != NULL) *out_handles = handle_cnt;
+    if (out_pages   != NULL) *out_pages   = page_cnt;
+    return POOL_QUERY_OK;
+}

@@ -20,6 +20,7 @@
 9. [内部工具函数](#9-内部工具函数)
 10. [已实施的性能优化](#10-已实施的性能优化)
 11. [潜在问题与改进方向](#11-潜在问题与改进方向)
+12. [查询 API](#12-查询-api)
 
 ## 附录
 
@@ -363,6 +364,54 @@ pool_user_pack(&b, &cfg);  // ID=129
    - *addr_out = data_base + page_start * page_size
 ```
 
+**可重入性分析**
+
+`pool_lock` 支持递归/可重入锁定。同一句柄可被多次锁定：
+
+```c
+pool_lock(&owner, handle, &addr1);  // lock_count: 0→1
+pool_lock(&owner, handle, &addr2);  // lock_count: 1→2, addr1 == addr2
+pool_unlock(&owner, handle);        // lock_count: 2→1
+pool_unlock(&owner, handle);        // lock_count: 1→0
+pool_free(&owner, handle);          // ✓ 允许（lock_count==0）
+```
+
+设计动机与约束：
+
+| 特性 | 说明 |
+|------|------|
+| 同一使用者多次锁定 | ✅ 允许，lock_count 递增 |
+| 不同使用者锁定同一句柄 | ✅ 允许（所有权在 alloc 时校验，不在 lock 时校验） |
+| lock_count 上限 | 65535（uint16_t），溢出 → OVERFLOW |
+| 释放前必须完全解锁 | lock_count 非零时 pool_free 返回 LOCKED |
+| defrag 保护 | lock_count > 0 的句柄不会被移动 |
+| 数据地址 | 每次 lock 返回相同地址（句柄位置不变）|
+
+实际场景示例——任务嵌套使用同一缓冲区：
+
+```c
+void process_buffer(pool_owner_t *o, uint32_t h)
+{
+    void *buf;
+    pool_lock(o, h, &buf);    // 外层锁定
+    read_data(buf);
+    
+    transform_buffer(o, h);   // 内层也会锁定同一句柄
+    
+    pool_unlock(o, h);        // 外层解锁
+}
+
+void transform_buffer(pool_owner_t *o, uint32_t h)
+{
+    void *buf;
+    pool_lock(o, h, &buf);    // 重入锁定 (lock_count++)
+    process(buf);
+    pool_unlock(o, h);        // 重入解锁 (lock_count--)
+}
+```
+
+**与 defrag 的交互**：锁定期间句柄不会被 `pool_defrag` 移动。如果某句柄在 defrag 进行中被锁定，defrag 会跳过它 —— 这是安全设计而非缺陷。碎片整理操作者需注意：紧持锁定的句柄会阻碍整理效果。
+
 ### 6.4 pool_unlock
 
 ```
@@ -584,6 +633,22 @@ defrag 扫描：
 - **跳过锁定句柄** — 锁定中的句柄不会被移动
 - **时间复杂度** — O(page_count × handle_count)，对 MCU 足够
 
+### 8.4 owner 参数语义
+
+`pool_defrag` 接受一个 `pool_owner_t *owner` 参数，但这个参数**仅用于获取 `cfg` 指针**。碎片整理作用于整个池中的所有使用者，不限于 owner 对应的使用者。
+
+```c
+// 以下两种调用等价（假设 a 和 b 都指向同一个 cfg）：
+pool_defrag(&owner_a);
+pool_defrag(&owner_b);
+```
+
+这意味着：
+- 可以用**任意有效的 owner** 调用 defrag，不影响操作范围
+- 不需要"root"或"管理员"所有者来执行整理
+- `lock_count > 0` 的句柄（任何所有者）都会被跳过
+- 移动数据后只更新元数据，不通知句柄持有者 —— 句柄持有者通过 `pool_lock` 重新获取地址即可感知新位置
+
 ---
 
 ## 9. 内部工具函数
@@ -595,6 +660,18 @@ bitmap_test(bitmap, page)  → (bitmap[page/8] >> (page%8)) & 1
 bitmap_set(bitmap, page)   → bitmap[page/8] |= 1 << (page%8)
 bitmap_clear(bitmap, page) → bitmap[page/8] &= ~(1 << (page%8))
 ```
+
+**位序与大小端（Endianness）说明**
+
+位图操作使用 `(page % 8)` 作为位偏移（0 = LSB, 7 = MSB），即**字节内 bit 0 对应 page 0，bit 7 对应 page 7**。此约定与 CPU 大小端无关——位操作（`<<`、`>>`、`&`、`|`、`~`）在 C 语言层面是**值语义**，不受内存字节序影响。
+
+```
+bitmap 字节布局示例（page_count=16, bitmap 占 2 字节）:
+  byte 0: [p7 p6 p5 p4 p3 p2 p1 p0]  ← bit0=page0, bit7=page7
+  byte 1: [p15 p14 p13 p12 p11 p10 p9 p8]  ← bit0=page8, bit7=page15
+```
+
+不过，当 bitmap 被整体视为 `uint16_t` 或 `uint32_t` 读取时（如调试器中以字为单位查看），字节内的位与页的对应关系在不同大小端平台上可能有不同视图。**代码中始终以字节为单位通过 `bitmap[page >> 3]` 和位运算访问，因此对大小端透明。** 仅在需要将 bitmap 整体导出或跨平台传输时才需关注字节序。
 
 ### 9.2 页标记
 
@@ -716,6 +793,112 @@ MCU 多线程场景的两条路径：
 | `defrag_mixed_blocks` | 不同大小块 (8/2/4/6页) + 级联移动 |
 
 当前测试总数：**42**，全部通过。详见 `test/test_pool.c`。
+
+### 11.6 pool_lock 可重入性风险
+
+lock_count 为 uint16_t（上限 65535）。在单线程 MCU 环境下，在同一调用链中超出 65535 次嵌套锁定几乎不可能。但若通过中断服务例程（ISR）意外重入锁定循环，可能导致 lock_count 溢出并返回 `POOL_LOCK_ERR_OVERFLOW`。此风险在单线程裸机环境下为理论风险。
+
+### 11.7 pool_defrag 全局作用域
+
+`pool_defrag` 接收一个 `pool_owner_t *` 参数，但作用域为整个池（所有使用者）。此设计简化了 API（不需要额外的"超级使用者"概念），但多使用者场景中，任何使用者均可触发全局碎片整理。这是设计意图，非缺陷。详见 [8.4 节](#84-owner-参数语义)。
+
+---
+
+## 12. 查询 API
+
+查询 API 是只读操作，不修改池状态。用于监控、调试和自适应分配策略。
+
+### 12.1 pool_query_free_pages
+
+```c
+pool_query_err_t pool_query_free_pages(pool_owner_t *owner, uint32_t *out_free);
+```
+
+遍历位图，统计空闲页数。
+
+| 参数 | 方向 | 说明 |
+|------|------|------|
+| owner | in | 任意有效的使用者上下文（仅用于访问 cfg） |
+| out_free | out | 返回空闲页数 |
+
+返回值：
+| 错误码 | 值 | 含义 |
+|--------|-----|------|
+| POOL_QUERY_OK | 0 | 成功 |
+| POOL_QUERY_ERR_NULL | 1 | owner/out_free 为 NULL |
+
+复杂度：O(page_count)。
+
+### 12.2 pool_query_handle_size
+
+```c
+pool_query_err_t pool_query_handle_size(pool_owner_t *owner, uint32_t handle,
+                                         uint32_t *out_pages, uint32_t *out_bytes);
+```
+
+查询指定句柄当前占用的页数和字节数。需要句柄属于当前使用者。
+
+| 参数 | 方向 | 说明 |
+|------|------|------|
+| owner | in | 使用者上下文（需与句柄所有者匹配） |
+| handle | in | 要查询的句柄 |
+| out_pages | out | 返回占用页数（传 NULL 表示不关心） |
+| out_bytes | out | 返回占用字节数（传 NULL 表示不关心） |
+
+返回值：
+| 错误码 | 值 | 含义 |
+|--------|-----|------|
+| POOL_QUERY_OK | 0 | 成功 |
+| POOL_QUERY_ERR_NULL | 1 | owner 为 NULL |
+| POOL_QUERY_ERR_INVALID | 2 | 句柄无效（不存在/已释放/代次不匹配） |
+| POOL_QUERY_ERR_OWNER | 3 | 句柄不属于此使用者 |
+
+复杂度：O(1)。
+
+### 12.3 pool_query_owner_info
+
+```c
+pool_query_err_t pool_query_owner_info(pool_owner_t *owner, uint16_t target_owner,
+                                        uint32_t *out_handles, uint32_t *out_pages);
+```
+
+查询指定使用者的资源占用统计。
+
+| 参数 | 方向 | 说明 |
+|------|------|------|
+| owner | in | 任意有效的使用者上下文（仅用于访问 cfg） |
+| target_owner | in | 要查询的使用者 ID |
+| out_handles | out | 返回活跃句柄数（传 NULL 表示不关心） |
+| out_pages | out | 返回占用总页数（传 NULL 表示不关心） |
+
+返回值：
+| 错误码 | 值 | 含义 |
+|--------|-----|------|
+| POOL_QUERY_OK | 0 | 成功 |
+| POOL_QUERY_ERR_NULL | 1 | owner 为 NULL |
+
+复杂度：O(handle_count)。
+
+### 12.4 使用示例
+
+```c
+// 监控：打印池使用率
+uint32_t free_pages;
+pool_query_free_pages(&owner, &free_pages);
+printf("Free: %u / %u pages (%.1f%%)\n",
+       free_pages, cfg.page_count,
+       100.0f * (cfg.page_count - free_pages) / cfg.page_count);
+
+// 调试：查询某句柄大小
+uint32_t pages, bytes;
+pool_query_handle_size(&owner, h, &pages, &bytes);
+printf("Handle %u: %u pages, %u bytes\n", h, pages, bytes);
+
+// 审计：统计系统使用者的资源占用
+uint32_t sys_handles, sys_pages;
+pool_query_owner_info(&owner, 0, &sys_handles, &sys_pages);
+printf("System owner(0): %u handles, %u pages\n", sys_handles, sys_pages);
+```
 
 ---
 

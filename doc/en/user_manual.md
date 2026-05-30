@@ -167,7 +167,7 @@ pool_lock_err_t pool_lock(pool_owner_t *owner, uint32_t handle, void **addr_out)
 pool_unlock_err_t pool_unlock(pool_owner_t *owner, uint32_t handle);
 ```
 
-Supports recursive locking (same handle can be locked multiple times). Each unlock decrements the count.
+**Reentrant locking**: the same handle can be locked multiple times (e.g. nested function calls). Each lock increments lock_count; each unlock decrements it. The handle cannot be freed until lock_count returns to 0. Capped at 65535 — exceeding returns `POOL_LOCK_ERR_OVERFLOW`. Locked handles are immune to defrag relocation, so code holding a lock can safely hold the data pointer.
 
 ### pool_free / pool_free_all
 
@@ -187,6 +187,26 @@ pool_resize_err_t pool_resize(pool_owner_t *owner, uint32_t handle, uint32_t new
 ```c
 pool_defrag_err_t pool_defrag(pool_owner_t *owner);
 ```
+
+Moves unlocked handles toward lower addresses to eliminate fragmentation. **Operates on the entire pool** (all owners); the owner parameter only provides the cfg pointer. Any valid `pool_owner_t` pointing to the same pool works equivalently.
+
+### Query API — Read-only Monitoring
+
+```c
+pool_query_err_t pool_query_free_pages(pool_owner_t *owner, uint32_t *out_free);
+pool_query_err_t pool_query_handle_size(pool_owner_t *owner, uint32_t handle,
+                                         uint32_t *out_pages, uint32_t *out_bytes);
+pool_query_err_t pool_query_owner_info(pool_owner_t *owner, uint16_t target_owner,
+                                        uint32_t *out_handles, uint32_t *out_pages);
+```
+
+| Function | Purpose | Complexity |
+|----------|---------|------------|
+| `pool_query_free_pages` | Count free pages in the pool | O(page_count) |
+| `pool_query_handle_size` | Query pages/bytes for a handle | O(1) |
+| `pool_query_owner_info` | Query handle count / page total for an owner | O(handle_count) |
+
+All query functions are read-only. Pass NULL for any `out_*` parameter you don't need.
 
 ## 7. License
 

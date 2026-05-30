@@ -115,12 +115,16 @@ lock: validate handle → check lock overflow → increment lock_count → retur
 unlock: validate → check not already 0 → decrement.
 free: validate → check lock_count==0 → unmark pages → free slot (keep generation).
 
-### pool_resize
-Shrink: free trailing pages in-place.
-Expand: try in-place first → collect following handles → decide who moves (self or followers) based on lock state and total sizes → move data and update metadata.
+**Reentrancy**: `pool_lock` supports recursive locking — the same handle can be locked multiple times, each call increments lock_count, each unlock decrements it. Lock count is capped at 65535 (uint16_t). The handle cannot be freed until fully unlocked (lock_count==0). Locked handles are also immune to defrag relocation. This is useful for nested function calls that all need to access the same buffer.
 
 ### pool_defrag
 Left-to-right scan: find free gaps → for each gap, find the smallest-page-start unlocked handle that fits → move it forward → repeat. Locked handles are never moved.
+
+**Owner parameter**: the `pool_owner_t *owner` argument is used only to obtain the `cfg` pointer. Defrag operates on the entire pool across all owners. Any valid owner pointing to the same pool is equivalent.
+
+### pool_resize
+Shrink: free trailing pages in-place.
+Expand: try in-place first → collect following handles → decide who moves (self or followers) based on lock state and total sizes → move data and update metadata.
 
 ## 7. Resize Decision Tree
 
@@ -149,7 +153,7 @@ Step 2: gap 8..11, candidate he(16)→8 → ha(0..3) hc(4..7) he(8..11) [FREE 12
 
 ## 9. Internal Utilities
 
-- `bitmap_test/set/clear` — single-bit operations
+- `bitmap_test/set/clear` — single-bit operations (endian-agnostic: bit shifts operate on values, not memory layout)
 - `pages_mark/unmark` — bulk mark/unmark with byte-level bitmap optimization
 - `data_move` — word-copy when 4-byte aligned, byte-copy fallback
 - `pages_find_free` — first-fit with byte-skip (full bytes of 0xFF skip 8 pages)
@@ -172,6 +176,43 @@ Step 2: gap 8..11, candidate he(16)→8 → ha(0..3) hc(4..7) he(8..11) [FREE 12
 - **Defrag algorithm**: current single-pass left-to-right is sufficient for MCU. Macro `POOL_DEFRAG_ALGO` reserved for future algorithm switching.
 - **Meta/data overlap**: not detected in pool_init (already checked since v2.0).
 - **page_size non-power-of-2**: rejected since v2.0.
+- **Lock reentrancy**: supports recursive locking. lock_count capped at 65535 — overflow returns ERR_OVERFLOW. Theoretical ISR risk in single-thread MCU environments.
+- **Defrag global scope**: defrag operates on the entire pool. The owner parameter only provides the cfg pointer; any valid owner works equivalently.
+- **Query API added**: three read-only query functions for monitoring/debugging: `pool_query_free_pages`, `pool_query_handle_size`, `pool_query_owner_info`. See section 12.
+
+---
+
+## 12. Query API
+
+Read-only, non-mutating functions for monitoring, debugging, and adaptive allocation strategies.
+
+### pool_query_free_pages
+```c
+pool_query_err_t pool_query_free_pages(pool_owner_t *owner, uint32_t *out_free);
+```
+Counts free pages by scanning the bitmap. Accepts any valid owner. O(page_count).
+
+### pool_query_handle_size
+```c
+pool_query_err_t pool_query_handle_size(pool_owner_t *owner, uint32_t handle,
+                                         uint32_t *out_pages, uint32_t *out_bytes);
+```
+Returns page count and byte count for a handle (must belong to owner). Accepts NULL for either output parameter. O(1).
+
+### pool_query_owner_info
+```c
+pool_query_err_t pool_query_owner_info(pool_owner_t *owner, uint16_t target_owner,
+                                        uint32_t *out_handles, uint32_t *out_pages);
+```
+Returns handle count and total page count for a given owner ID. Accepts any valid owner for the cfg pointer; target_owner can be any owner ID. Accepts NULL for either output parameter. O(handle_count).
+
+### Error codes
+| Code | Value | Meaning |
+|------|-------|---------|
+| POOL_QUERY_OK | 0 | Success |
+| POOL_QUERY_ERR_NULL | 1 | owner/out pointer is NULL |
+| POOL_QUERY_ERR_INVALID | 2 | Handle invalid (only for handle_size) |
+| POOL_QUERY_ERR_OWNER | 3 | Handle does not belong to this owner |
 
 ---
 

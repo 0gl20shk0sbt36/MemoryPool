@@ -171,7 +171,9 @@ pool_lock_err_t pool_lock(pool_owner_t *owner, uint32_t handle, void **addr_out)
 pool_unlock_err_t pool_unlock(pool_owner_t *owner, uint32_t handle);
 ```
 
-支持递归锁（同一句柄可多次锁定），每次解锁递减计数。
+**可重入锁定**：同一句柄可被多次锁定（嵌套调用场景）。每次 lock 递增 lock_count，每次 unlock 递减。lock_count 回到 0 后句柄方可释放。上限 65535 次 —— 超出返回 `POOL_LOCK_ERR_OVERFLOW`。
+
+锁定期间句柄不会被 `pool_defrag` 移动，因此持有锁的代码可以安全持有数据指针。
 
 ### pool_free / pool_free_all — 释放
 
@@ -191,6 +193,26 @@ pool_resize_err_t pool_resize(pool_owner_t *owner, uint32_t handle, uint32_t new
 ```c
 pool_defrag_err_t pool_defrag(pool_owner_t *owner);
 ```
+
+将未锁定句柄向低地址方向移动，消除碎片。**作用域为整个池**（所有使用者），owner 参数仅用于获取 cfg 指针。任意有效的 `pool_owner_t` 均可调用，效果等价。
+
+### 查询 API — 只读监控
+
+```c
+pool_query_err_t pool_query_free_pages(pool_owner_t *owner, uint32_t *out_free);
+pool_query_err_t pool_query_handle_size(pool_owner_t *owner, uint32_t handle,
+                                         uint32_t *out_pages, uint32_t *out_bytes);
+pool_query_err_t pool_query_owner_info(pool_owner_t *owner, uint16_t target_owner,
+                                        uint32_t *out_handles, uint32_t *out_pages);
+```
+
+| 函数 | 用途 | 复杂度 |
+|------|------|--------|
+| `pool_query_free_pages` | 查询池中空闲页数 | O(page_count) |
+| `pool_query_handle_size` | 查询某句柄占用的页数/字节数 | O(1) |
+| `pool_query_owner_info` | 查询某使用者的句柄数/占用页数 | O(handle_count) |
+
+所有查询 API 均为只读，不修改池状态。`out_*` 参数可传 NULL 表示不关心该项。
 
 ## 7. 许可
 
