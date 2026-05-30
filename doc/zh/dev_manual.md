@@ -911,31 +911,37 @@ printf("System owner(0): %u handles, %u pages\n", sys_handles, sys_pages);
 
 - **零默认开销**：未启用插件时，所有 hook 宏展开为 `do{}while(0)`，编译器完全消除
 - **编译期展开**：启用插件后，hook 展开为直接函数调用（非函数指针），编译器可内联
-- **自动发现**：`configure.py` 扫描 `plugins/` 目录，检测插件实现的 hook，自动生成调用链
+- **外部发现**：插件通过 `lib/*/` submodule 提供，每个插件目录包含 `plugin.cmake` 元数据文件
+- **手动工作流**：`configure.py --gen-cmake` 扫描发现插件，生成用户可编辑的 `.cmake`；用户编辑 ON/OFF 后，`configure.py` 生成 `pool_plugin_config.h`
 - **纯 C99**：不依赖弱符号、函数指针表或运行时注册
 
 ### 13.2 架构
 
 ```
-plugins/                        pool_hooks.h
-┌──────────┐                    ┌──────────────────────┐
-│ swap/    │                    │ #ifndef POOL_HOOK_*  │
-│ plugin.h │──→ configure.py ──→│ #define ... do{}...  │← 默认空（零开销）
-│ plugin.c │                    │ #endif               │
-└──────────┘                    └──────────────────────┘
-                                       ↑ 被覆盖
-     pool_plugin_config.h (生成)       │
-     ┌──────────────────────────┐      │
-     │ #undef POOL_HOOK_*       │──────┘
-     │ #define POOL_HOOK_*(...) │
-     │   swap_xxx(&swap_ctx,..) │
-     └──────────────────────────┘
-              ↓ 被 include
-         src/pool.c
-         ┌──────────────────────┐
-         │ POOL_HOOK_PRE_LOCK(  │
-         │   cfg, owner, h);    │──→ swap_pre_lock(&swap_ctx, cfg, owner, h)
-         └──────────────────────┘
+lib/pool_log/                   pool_hooks.h
+┌────────────────────┐          ┌──────────────────────┐
+│ src/pool_log.c     │          │ #ifndef POOL_HOOK_*  │
+│ include/pool_log.h │          │ #define ... do{}...  │← 默认空（零开销）
+│ plugins/logging/   │          │ #endif               │
+│  ├ plugin.h        │          └──────────────────────┘
+│  ├ plugin.c        │                   ↑ 被覆盖
+│  └ plugin.cmake ───┼── configure.py ──→│  (生成)
+└────────────────────┘          │
+                                │
+     pool_plugin_config.cmake   │    pool_plugin_config.h
+     (生成，用户可编辑)         │    ┌──────────────────────┐
+     ┌──────────────────────┐   │    │ #undef POOL_HOOK_*   │
+     │ option(USE_LOGGING   │   │    │ #define POOL_HOOK_*  │
+     │   "..." ON)          │   │    │   logging_*(&ctx,..) │
+     │ list(APPEND SOURCES  │   │    └──────────────────────┘
+     │   lib/pool_log/...)  │   │              ↓ 被 include
+     └──────────────────────┘   │         src/pool.c
+                                │    ┌──────────────────────┐
+                                │    │ POOL_HOOK_PRE_LOCK(  │
+                                │    │   cfg, owner, h);    │
+                                └───→│   logging_pre_lock(  │
+                                     │     &logging_ctx,...)│
+                                     └──────────────────────┘
 ```
 
 ### 13.3 全部 Hook 点（14 个）
@@ -962,10 +968,23 @@ plugins/                        pool_hooks.h
 
 **第一步：编写插件**
 
-在 `plugins/<插件名>/plugin.h` 中声明 hook 函数：
+创建插件的目录结构：
+
+```
+lib/pool_myplugin/
+├── plugins/myplugin/
+│   ├── plugin.h
+│   ├── plugin.c
+│   └── plugin.cmake     ← configure.py 的元数据文件
+├── src/                 ← 可选：独立核心库
+├── include/             ← 可选：核心库头文件
+└── CMakeLists.txt
+```
+
+在 `lib/pool_myplugin/plugins/myplugin/plugin.h` 中声明 hook 函数：
 
 ```c
-// plugins/my_plugin/plugin.h
+// lib/pool_myplugin/plugins/myplugin/plugin.h
 #include "pool.h"
 
 extern int my_ctx;  // 插件自己的上下文
@@ -980,7 +999,7 @@ void my_post_alloc(void *ctx, pool_cfg_t *cfg, pool_owner_t *owner,
 **第二步：实现函数**
 
 ```c
-// plugins/my_plugin/plugin.c
+// lib/pool_myplugin/plugins/myplugin/plugin.c
 #include "plugin.h"
 
 int my_ctx = 0;
@@ -993,19 +1012,48 @@ void my_pre_lock(void *ctx, pool_cfg_t *cfg, pool_owner_t *owner, uint32_t handl
 // ...
 ```
 
-**第三步：构建**
+**第三步：编写 plugin.cmake**
 
-```sh
-cmake -B build
+```cmake
+# lib/pool_myplugin/plugins/myplugin/plugin.cmake
+set(POOL_PLUGIN_MYPLUGIN_SOURCES   src/mylib.c plugins/myplugin/plugin.c)
+set(POOL_PLUGIN_MYPLUGIN_INCLUDES  include)
 ```
 
-CMake 自动运行 `configure.py`，检测到 `plugins/my_plugin/` 后生成 `pool_plugin_config.h`，定义 `POOL_PLUGINS_ENABLED`，编译插件源文件到 `libpool.a`。
+路径相对于插件的库根目录（`lib/pool_myplugin/`）。
 
-**无插件时**：
+**第四步：注册到 MemoryPool**
+
+```sh
+# 添加 submodule（首次）
+cd path/to/MemoryPool
+git submodule add <url> lib/pool_myplugin
+
+# 扫描并生成配置骨架
+python3 configure.py --gen-cmake --scan-dir lib
+
+# 编辑 pool_plugin_config.cmake — 设置 ON/OFF
+vim pool_plugin_config.cmake
+
+# 生成 hook 头文件
+python3 configure.py
+
+# 编译
+cmake -B build
+cmake --build build
+```
+
+**第五步：验证**
+
+```
+Plugins enabled: myplugin logging
+→ POOL_HOOK_* 宏重定向到 myplugin_xxx(ctx, ...)
+```
+
+**无插件启用**（`pool_plugin_config.cmake` 中全部 OFF）：
 
 ```
 Plugins: none (hooks disabled, zero overhead)
-→ pool_plugin_config.h 生成空壳
 → POOL_PLUGINS_ENABLED 未定义
 → 所有 POOL_HOOK_* 宏 = do{}while(0)
 → 编译产物零额外指令
@@ -1025,13 +1073,14 @@ Plugins: none (hooks disabled, zero overhead)
 
 | 规则 | 说明 |
 |------|------|
-| 目录名 = 插件名 | `plugins/<name>/plugin.h` |
-| 函数命名 | `{name}_{hook}` 例如 `swap_pre_lock` |
-| 上下文变量 | `extern {name}_ctx_t {name}_ctx` |
+| 库根目录 = submodule 名 | `lib/<libname>/plugins/<plugin>/` |
+| 函数命名 | `{plugin}_{hook}` 例如 `logging_post_init` |
+| 上下文变量 | `extern {plugin}_ctx_t {plugin}_ctx` |
 | 第一个参数 | `void *ctx` — 透传上下文指针 |
-| 第二个参数 | `pool_cfg_t *cfg` — 池配置 |
-| 零依赖 | 插件不修改池状态（只读或操作外部资源） |
-| 头文件 | 必须 `#include "pool.h"` 以使用 `pool_cfg_t` 等类型 |
+| 第二个参数 | `pool_cfg_t *cfg` — 池配置指针 |
+| 无副作用 | 插件可读取池状态或管理外部资源，但禁止修改池内部结构 |
+| 头文件依赖 | 必须 `#include "pool.h"` 使用 `pool_cfg_t` 等类型 |
+| 元数据文件 | 每个插件需提供 `plugin.cmake` 供 `configure.py --gen-cmake` 发现 |
 
 ---
 

@@ -227,31 +227,37 @@ The hook system injects external logic into core pool operations without modifyi
 
 - **Zero default overhead**: when no plugins exist, all hooks expand to `do{}while(0)` — fully eliminated by the compiler
 - **Compile-time expansion**: enabled hooks expand to direct function calls (not function pointers), allowing inlining
-- **Auto-discovery**: `configure.py` scans `plugins/`, detects hook implementations, generates the call chain
+- **External discovery**: plugins live in `lib/*/` submodules; each provides a `plugin.cmake` metadata file
+- **Manual workflow**: `configure.py --gen-cmake` scans for plugins, generates a user-editable `.cmake`; user toggles ON/OFF, then `configure.py` generates the `pool_plugin_config.h`
 - **Pure C99**: no weak symbols, runtime registration, or function pointer tables
 
 ### 13.2 Architecture
 
 ```
-plugins/                        pool_hooks.h
-┌──────────┐                    ┌──────────────────────┐
-│ swap/    │                    │ #ifndef POOL_HOOK_*  │
-│ plugin.h │──→ configure.py ──→│ #define ... do{}...  │← default empty
-│ plugin.c │                    │ #endif               │
-└──────────┘                    └──────────────────────┘
-                                       ↑ overridden by
-     pool_plugin_config.h (generated)  │
-     ┌──────────────────────────┐      │
-     │ #undef POOL_HOOK_*       │──────┘
-     │ #define POOL_HOOK_*(...) │
-     │   swap_xxx(&swap_ctx,..) │
-     └──────────────────────────┘
-              ↓ included by
-         src/pool.c
-         ┌──────────────────────┐
-         │ POOL_HOOK_PRE_LOCK(  │
-         │   cfg, owner, h);    │──→ swap_pre_lock(&swap_ctx, cfg, owner, h)
-         └──────────────────────┘
+lib/pool_log/                   pool_hooks.h
+┌────────────────────┐          ┌──────────────────────┐
+│ src/pool_log.c     │          │ #ifndef POOL_HOOK_*  │
+│ include/pool_log.h │          │ #define ... do{}...  │← default empty
+│ plugins/logging/   │          │ #endif               │
+│  ├ plugin.h        │          └──────────────────────┘
+│  ├ plugin.c        │                   ↑ overridden by
+│  └ plugin.cmake ───┼── configure.py ──→│  (generated)
+└────────────────────┘          │
+                                │
+     pool_plugin_config.cmake   │    pool_plugin_config.h
+     (generated, user-editable) │    ┌──────────────────────┐
+     ┌──────────────────────┐   │    │ #undef POOL_HOOK_*   │
+     │ option(USE_LOGGING   │   │    │ #define POOL_HOOK_*  │
+     │   "..." ON)          │   │    │   logging_*(&ctx,..) │
+     │ list(APPEND SOURCES  │   │    └──────────────────────┘
+     │   lib/pool_log/...)  │   │              ↓ included by
+     └──────────────────────┘   │         src/pool.c
+                                │    ┌──────────────────────┐
+                                │    │ POOL_HOOK_PRE_LOCK(  │
+                                │    │   cfg, owner, h);    │
+                                └───→│   logging_pre_lock(  │
+                                     │     &logging_ctx,...)│
+                                     └──────────────────────┘
 ```
 
 ### 13.3 Complete Hook List (15 macros, 14 distinct points)
@@ -278,8 +284,21 @@ plugins/                        pool_hooks.h
 
 **Step 1: Write plugin header**
 
+Create the directory structure for your plugin:
+
+```
+lib/pool_myplugin/
+├── plugins/myplugin/
+│   ├── plugin.h
+│   ├── plugin.c
+│   └── plugin.cmake     ← metadata for configure.py
+├── src/                 ← optional: core library if standalone
+├── include/             ← optional: core library header
+└── CMakeLists.txt
+```
+
 ```c
-// plugins/my_plugin/plugin.h
+// lib/pool_myplugin/plugins/myplugin/plugin.h
 #include "pool.h"
 
 extern int my_ctx;
@@ -291,7 +310,7 @@ void my_pre_lock(void *ctx, pool_cfg_t *cfg, pool_owner_t *owner, uint32_t handl
 **Step 2: Implement**
 
 ```c
-// plugins/my_plugin/plugin.c
+// lib/pool_myplugin/plugins/myplugin/plugin.c
 #include "plugin.h"
 int my_ctx = 0;
 
@@ -301,13 +320,45 @@ void my_pre_lock(void *ctx, pool_cfg_t *cfg, pool_owner_t *owner, uint32_t handl
 }
 ```
 
-**Step 3: Build**
+**Step 3: Write plugin.cmake**
 
-```sh
-cmake -B build   # auto-runs configure.py, detects plugins, builds them into libpool.a
+```cmake
+# lib/pool_myplugin/plugins/myplugin/plugin.cmake
+set(POOL_PLUGIN_MYPLUGIN_SOURCES   src/mylib.c plugins/myplugin/plugin.c)
+set(POOL_PLUGIN_MYPLUGIN_INCLUDES  include)
 ```
 
-**No plugins installed**:
+The paths are relative to the plugin's library root (`lib/pool_myplugin/`).
+
+**Step 4: Register in MemoryPool**
+
+```sh
+# Add submodule (first time)
+cd path/to/MemoryPool
+git submodule add <url> lib/pool_myplugin
+
+# Scan and generate config skeleton
+python3 configure.py --gen-cmake --scan-dir lib
+
+# Edit pool_plugin_config.cmake — set ON/OFF
+vim pool_plugin_config.cmake
+
+# Generate hook header
+python3 configure.py
+
+# Build
+cmake -B build
+cmake --build build
+```
+
+**Step 5: Verify**
+
+```
+Plugins enabled: myplugin logging
+→ POOL_HOOK_* macros redirect to myplugin_xxx(ctx, ...)
+```
+
+**No plugins enabled** (all OFF in `pool_plugin_config.cmake`):
 
 ```
 Plugins: none (hooks disabled, zero overhead)
@@ -328,13 +379,14 @@ Plugins: none (hooks disabled, zero overhead)
 
 | Rule | Detail |
 |------|--------|
-| Directory = plugin name | `plugins/<name>/plugin.h` |
-| Function naming | `{name}_{hook}` e.g. `swap_pre_lock` |
-| Context variable | `extern {name}_ctx_t {name}_ctx` |
+| Library root = submodule name | `lib/<name>/plugins/<plugin>/plugin.h` |
+| Function naming | `{plugin}_{hook}` e.g. `logging_post_init` |
+| Context variable | `extern {plugin}_ctx_t {plugin}_ctx` |
 | First param | `void *ctx` — opaque context pointer |
 | Second param | `pool_cfg_t *cfg` — pool configuration |
 | No side effects | Plugins read pool state or manage external resources; they must not mutate the pool |
 | Header includes | Must `#include "pool.h"` for `pool_cfg_t` etc. |
+| Metadata | `plugins/<plugin>/plugin.cmake` is required for `configure.py --gen-cmake` discovery |
 
 ---
 

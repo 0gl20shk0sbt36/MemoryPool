@@ -2,3 +2,4 @@ build/
 .deepseek/
 .tmp/
 include/pool_plugin_config.h
+pool_plugin_config.cmake

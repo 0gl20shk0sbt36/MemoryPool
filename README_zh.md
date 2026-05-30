@@ -4,7 +4,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![C99](https://img.shields.io/badge/C-C99-blue)]()
-[![Tests](https://img.shields.io/badge/tests-29%20passed-brightgreen)]()
+[![Tests](https://img.shields.io/badge/tests-18%20passed-brightgreen)]()
 
 基于页的内存管理系统，专为嵌入式 MCU 设计。纯 C99，零系统调用，所有内存由用户静态提供。
 
@@ -15,6 +15,7 @@
 - **句柄系统** — 不透明 32 位句柄，代次计数器防 use-after-free
 - **所有权隔离** — 0~127 系统 ID（手动分配），128~25565 用户 ID（自动分配）
 - **全功能 API** — 分配、锁定/解锁、释放、改变大小、碎片整理、批量释放
+- **插件系统** — 编译期零开销的插桩系统，支持事件日志、swap 等
 
 ## 文档
 
@@ -24,24 +25,29 @@
 | [开发手册](doc/zh/dev_manual.md) | 中文 / [EN](doc/en/dev_manual.md) |
 
 - **用户手册** — 快速上手、API 参考、参数选择指南、错误码速查
-- **开发手册** — 内部架构、元数据布局、句柄编码、核心算法、已实施优化
+- **开发手册** — 内部架构、元数据布局、句柄编码、核心算法、插件系统
 
 ## 文件结构
 
 ```
-├── CMakeLists.txt          — CMake 构建入口
+├── CMakeLists.txt                 — CMake 构建入口
+├── configure.py                   — 插件扫描与配置生成器
+├── pool_plugin_config.cmake       — 插件配置（由 configure.py --gen-cmake 生成，用户可编辑）
 ├── include/
-│   └── pool.h              — 公共 API 头文件 (~340行)
+│   ├── pool.h                     — 公共 API 头文件 (~340行)
+│   ├── pool_hooks.h               — 14 个编译期 hook 点定义
+│   └── pool_plugin_config.h       — 生成的 hook 重定向（.gitignore 忽略）
 ├── src/
-│   └── pool.c              — 实现 (~740行)
+│   └── pool.c                     — 实现 (~740行)
 ├── test/
-│   ├── test_pool.c         — 29 项单元测试
+│   ├── test_pool.c                — 18 项单元测试
 │   └── CMakeLists.txt
+├── lib/                           — 外部 submodule（如 pool_log）
 ├── doc/
-│   ├── en/                 — 英文手册
+│   ├── en/                        — 英文手册
 │   │   ├── user_manual.md
 │   │   └── dev_manual.md
-│   └── zh/                 — 中文手册
+│   └── zh/                        — 中文手册
 │       ├── user_manual.md
 │       └── dev_manual.md
 ├── LICENSE
@@ -85,17 +91,49 @@ pool_unlock(&owner, handle);
 pool_free(&owner, handle);
 ```
 
+## 插件系统
+
+插件在编译期接入 pool 的各个事件点（init/alloc/free/lock/unlock/resize/defrag/free_all），无插件时零运行时开销。
+
+### 添加插件
+
+```sh
+# 1. 添加 submodule
+git submodule add <url> lib/<插件名>
+
+# 2. 扫描并生成配置骨架
+python3 configure.py --gen-cmake --scan-dir lib
+
+# 3. 编辑 option（ON/OFF）
+vim pool_plugin_config.cmake
+
+# 4. 生成 hook 头文件
+python3 configure.py
+
+# 5. 编译
+cmake -B build
+cmake --build build
+```
+
+### 可用插件
+
+| 插件 | 说明 | 来源 |
+|------|------|------|
+| **logging** | 事件日志，支持等级过滤和时间间隔 | [pool_log](https://github.com/0gl20shk0sbt36/pool_log) |
+
+> 想写一个插件？参见[开发手册 — 插件系统](doc/zh/dev_manual.md)了解 hook API 和约定。
+
 ## 构建
 
 需要 CMake ≥ 3.10 和 C99 编译器（GCC、Clang 等）。
 
 ```sh
-# 仅编译库
+# 仅编译库（无插件）
 cmake -B build
 cmake --build build
 # 产物: build/libpool.a
 
-# 库 + 测试
+# 库 + 测试（插件按 pool_plugin_config.cmake 启用）
 cmake -B build -DPOOL_BUILD_TEST=ON
 cmake --build build
 ctest --test-dir build
