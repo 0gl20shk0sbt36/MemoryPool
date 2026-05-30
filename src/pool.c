@@ -11,6 +11,12 @@
 #include <stdbool.h>
 #include <string.h>
 
+/* 插件 hook 系统 — 编译期零开销 */
+#ifdef POOL_PLUGINS_ENABLED
+#include "pool_plugin_config.h"
+#endif
+#include "pool_hooks.h"
+
 /*===========================================================================
  * 内部工具函数
  *===========================================================================*/
@@ -326,6 +332,7 @@ pool_init_err_t pool_init(pool_cfg_t *cfg,
         cfg->handle_table[i].generation = 0;
     }
 
+    POOL_HOOK_POST_INIT(cfg);
     return POOL_INIT_OK;
 }
 
@@ -386,6 +393,8 @@ pool_alloc_err_t pool_alloc_pages(pool_owner_t *owner, uint32_t page_count, uint
 
     /* 编码句柄 */
     *handle_out = (((uint32_t)e->generation) << cfg->handle_index_bits) | (uint32_t)h_idx;
+
+    POOL_HOOK_POST_ALLOC(cfg, owner, (uint32_t)pg_start, page_count, *handle_out);
     return POOL_ALLOC_OK;
 }
 
@@ -414,8 +423,11 @@ pool_lock_err_t pool_lock(pool_owner_t *owner, uint32_t handle, void **addr_out)
     if (e->owner_id != owner->owner_id) return POOL_LOCK_ERR_OWNER;
     if (e->lock_count == 0xFFFFu)     return POOL_LOCK_ERR_OVERFLOW;
 
+    POOL_HOOK_PRE_LOCK(cfg, owner, handle);
     e->lock_count++;
     *addr_out = (uint8_t *)cfg->data_base + (size_t)e->page_start * cfg->page_size;
+
+    POOL_HOOK_POST_LOCK(cfg, owner, handle, *addr_out);
     return POOL_LOCK_OK;
 }
 
@@ -431,7 +443,9 @@ pool_unlock_err_t pool_unlock(pool_owner_t *owner, uint32_t handle)
     if (e->owner_id != owner->owner_id) return POOL_UNLOCK_ERR_OWNER;
     if (e->lock_count == 0)           return POOL_UNLOCK_ERR_NOT_LOCKED;
 
+    POOL_HOOK_PRE_UNLOCK(cfg, owner, handle);
     e->lock_count--;
+    POOL_HOOK_POST_UNLOCK(cfg, owner, handle);
     return POOL_UNLOCK_OK;
 }
 
@@ -446,6 +460,8 @@ pool_free_err_t pool_free(pool_owner_t *owner, uint32_t handle)
     if (e == NULL)                    return POOL_FREE_ERR_INVALID;
     if (e->owner_id != owner->owner_id) return POOL_FREE_ERR_OWNER;
     if (e->lock_count > 0)            return POOL_FREE_ERR_LOCKED;
+
+    POOL_HOOK_PRE_FREE(cfg, owner, handle);
 
     /* 释放页面 */
     pages_unmark(cfg, e->page_start, e->page_count);
@@ -464,6 +480,7 @@ pool_free_err_t pool_free(pool_owner_t *owner, uint32_t handle)
         }
     }
 
+    POOL_HOOK_POST_FREE(cfg, owner, handle);
     return POOL_FREE_OK;
 }
 
@@ -481,6 +498,9 @@ pool_resize_err_t pool_resize(pool_owner_t *owner, uint32_t handle, uint32_t new
     if (e->owner_id != owner->owner_id) return POOL_RESIZE_ERR_OWNER;
 
     uint32_t cur_pages = e->page_count;
+
+    POOL_HOOK_PRE_RESIZE(cfg, owner, handle, cur_pages, new_page_count);
+
     if (new_page_count == cur_pages) return POOL_RESIZE_OK;
 
     /* --- 缩小：原地释放尾部页面 --- */
@@ -488,6 +508,7 @@ pool_resize_err_t pool_resize(pool_owner_t *owner, uint32_t handle, uint32_t new
         uint32_t extra = cur_pages - new_page_count;
         pages_unmark(cfg, e->page_start + new_page_count, extra);
         e->page_count = new_page_count;
+        POOL_HOOK_POST_RESIZE(cfg, owner, handle, cur_pages, new_page_count);
         return POOL_RESIZE_OK;
     }
 
@@ -508,6 +529,7 @@ pool_resize_err_t pool_resize(pool_owner_t *owner, uint32_t handle, uint32_t new
             uint16_t self_idx = (uint16_t)(handle & cfg->handle_index_mask);
             pages_mark(cfg, old_end, extra_needed, self_idx);
             e->page_count = new_page_count;
+            POOL_HOOK_POST_RESIZE(cfg, owner, handle, cur_pages, new_page_count);
             return POOL_RESIZE_OK;
         }
     }
@@ -578,6 +600,7 @@ pool_resize_err_t pool_resize(pool_owner_t *owner, uint32_t handle, uint32_t new
         pages_mark(cfg, (uint32_t)new_start, new_page_count, self_idx);
         e->page_start = (uint32_t)new_start;
         e->page_count = new_page_count;
+        POOL_HOOK_POST_RESIZE(cfg, owner, handle, cur_pages, new_page_count);
         return POOL_RESIZE_OK;
     }
 
@@ -626,6 +649,7 @@ pool_resize_err_t pool_resize(pool_owner_t *owner, uint32_t handle, uint32_t new
         e->page_count = new_page_count;
     }
 
+    POOL_HOOK_POST_RESIZE(cfg, owner, handle, cur_pages, new_page_count);
     return POOL_RESIZE_OK;
 }
 
@@ -667,6 +691,8 @@ pool_defrag_err_t pool_defrag(pool_owner_t *owner)
     if (owner == NULL) return POOL_DEFRAG_ERR_NULL;
     pool_cfg_t *cfg = owner->cfg;
 
+    POOL_HOOK_PRE_DEFRAG(cfg);
+
     uint32_t cursor = 0;
     while (cursor < cfg->page_count) {
         /* 跳过已用页 */
@@ -692,6 +718,8 @@ pool_defrag_err_t pool_defrag(pool_owner_t *owner)
 
             /* 移动数据 */
             data_move(cfg, he->page_start, gap_start, he->page_count);
+            POOL_HOOK_DEFRAG_MOVE(cfg, he->page_start, gap_start,
+                                  he->page_count, (uint32_t)h_idx);
             /* 更新页映射 */
             pages_unmark(cfg, he->page_start, he->page_count);
             pages_mark(cfg, gap_start, he->page_count, (uint16_t)h_idx);
@@ -705,6 +733,7 @@ pool_defrag_err_t pool_defrag(pool_owner_t *owner)
         cursor = gap_end;
     }
 
+    POOL_HOOK_POST_DEFRAG(cfg);
     return POOL_DEFRAG_OK;
 }
 
@@ -726,6 +755,8 @@ pool_free_all_err_t pool_free_all(pool_owner_t *owner, bool forced)
         }
     }
 
+    POOL_HOOK_PRE_FREE_ALL(cfg, owner, forced);
+
     /* 释放所有属于此使用者的句柄 */
     for (uint32_t i = 0; i < cfg->handle_count; i++) {
         pool_handle_entry_t *e = &cfg->handle_table[i];
@@ -740,6 +771,7 @@ pool_free_all_err_t pool_free_all(pool_owner_t *owner, bool forced)
         }
     }
 
+    POOL_HOOK_POST_FREE_ALL(cfg, owner, forced);
     return POOL_FREE_ALL_OK;
 }
 

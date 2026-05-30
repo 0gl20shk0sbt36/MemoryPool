@@ -21,6 +21,9 @@
 10. Implemented Performance Optimizations
 11. Known Issues & Future Directions
 
+12. Query API
+13. Plugins & Hook System
+
 Appendices: A. File Index / B. Vulnerability Analysis
 
 ---
@@ -213,6 +216,125 @@ Returns handle count and total page count for a given owner ID. Accepts any vali
 | POOL_QUERY_ERR_NULL | 1 | owner/out pointer is NULL |
 | POOL_QUERY_ERR_INVALID | 2 | Handle invalid (only for handle_size) |
 | POOL_QUERY_ERR_OWNER | 3 | Handle does not belong to this owner |
+
+---
+
+## 13. Plugins & Hook System
+
+### 13.1 Design
+
+The hook system injects external logic into core pool operations without modifying `pool.c`. Design goals:
+
+- **Zero default overhead**: when no plugins exist, all hooks expand to `do{}while(0)` — fully eliminated by the compiler
+- **Compile-time expansion**: enabled hooks expand to direct function calls (not function pointers), allowing inlining
+- **Auto-discovery**: `configure.py` scans `plugins/`, detects hook implementations, generates the call chain
+- **Pure C99**: no weak symbols, runtime registration, or function pointer tables
+
+### 13.2 Architecture
+
+```
+plugins/                        pool_hooks.h
+┌──────────┐                    ┌──────────────────────┐
+│ swap/    │                    │ #ifndef POOL_HOOK_*  │
+│ plugin.h │──→ configure.py ──→│ #define ... do{}...  │← default empty
+│ plugin.c │                    │ #endif               │
+└──────────┘                    └──────────────────────┘
+                                       ↑ overridden by
+     pool_plugin_config.h (generated)  │
+     ┌──────────────────────────┐      │
+     │ #undef POOL_HOOK_*       │──────┘
+     │ #define POOL_HOOK_*(...) │
+     │   swap_xxx(&swap_ctx,..) │
+     └──────────────────────────┘
+              ↓ included by
+         src/pool.c
+         ┌──────────────────────┐
+         │ POOL_HOOK_PRE_LOCK(  │
+         │   cfg, owner, h);    │──→ swap_pre_lock(&swap_ctx, cfg, owner, h)
+         └──────────────────────┘
+```
+
+### 13.3 Complete Hook List (15 macros, 14 distinct points)
+
+| # | Hook Macro | Trigger Point | Parameters |
+|---|-----------|---------------|------------|
+| 1 | `POOL_HOOK_POST_INIT` | `pool_init` complete | `cfg` |
+| 2 | `POOL_HOOK_POST_ALLOC` | `pool_alloc_pages` success | `cfg, owner, start, count, handle` |
+| 3 | `POOL_HOOK_PRE_FREE` | `pool_free` validated, before unmark | `cfg, owner, handle` |
+| 4 | `POOL_HOOK_POST_FREE` | `pool_free` after unmark | `cfg, owner, handle` |
+| 5 | `POOL_HOOK_PRE_LOCK` | `pool_lock` validated, before incr | `cfg, owner, handle` |
+| 6 | `POOL_HOOK_POST_LOCK` | `pool_lock` after incr | `cfg, owner, handle, addr` |
+| 7 | `POOL_HOOK_PRE_UNLOCK` | `pool_unlock` before decr | `cfg, owner, handle` |
+| 8 | `POOL_HOOK_POST_UNLOCK` | `pool_unlock` after decr | `cfg, owner, handle` |
+| 9 | `POOL_HOOK_PRE_RESIZE` | `pool_resize` validated | `cfg, owner, h, old, new` |
+| 10 | `POOL_HOOK_POST_RESIZE` | `pool_resize` complete (4 paths) | `cfg, owner, h, old, new` |
+| 11 | `POOL_HOOK_PRE_DEFRAG` | `pool_defrag` start | `cfg` |
+| 12 | `POOL_HOOK_DEFRAG_MOVE` | each `data_move` | `cfg, src, dst, cnt, idx` |
+| 13 | `POOL_HOOK_POST_DEFRAG` | `pool_defrag` complete | `cfg` |
+| 14 | `POOL_HOOK_PRE_FREE_ALL` | `pool_free_all` validated | `cfg, owner, forced` |
+| 15 | `POOL_HOOK_POST_FREE_ALL` | `pool_free_all` complete | `cfg, owner, forced` |
+
+### 13.4 Usage
+
+**Step 1: Write plugin header**
+
+```c
+// plugins/my_plugin/plugin.h
+#include "pool.h"
+
+extern int my_ctx;
+
+void my_pre_lock(void *ctx, pool_cfg_t *cfg, pool_owner_t *owner, uint32_t handle);
+// declare any hooks you implement with naming: {plugin}_{hook}
+```
+
+**Step 2: Implement**
+
+```c
+// plugins/my_plugin/plugin.c
+#include "plugin.h"
+int my_ctx = 0;
+
+void my_pre_lock(void *ctx, pool_cfg_t *cfg, pool_owner_t *owner, uint32_t handle) {
+    (void)ctx; (void)cfg; (void)owner; (void)handle;
+    // your logic here
+}
+```
+
+**Step 3: Build**
+
+```sh
+cmake -B build   # auto-runs configure.py, detects plugins, builds them into libpool.a
+```
+
+**No plugins installed**:
+
+```
+Plugins: none (hooks disabled, zero overhead)
+→ all POOL_HOOK_* macros → do{}while(0)
+→ zero extra instructions in the binary
+```
+
+### 13.5 Example Use Cases
+
+| Plugin | Hooks Used | Purpose |
+|--------|-----------|---------|
+| **swap** | PRE_LOCK, PRE_FREE, DEFRAG_MOVE, PRE_UNLOCK | Transparent page swapping to external storage |
+| **log** | POST_ALLOC, POST_FREE, POST_LOCK, POST_UNLOCK | Operation logging |
+| **perf** | PRE_* + POST_* pairs | Latency measurement per operation |
+| **guard** | PRE_LOCK, PRE_FREE | Security checks before operations |
+
+### 13.6 Plugin Conventions
+
+| Rule | Detail |
+|------|--------|
+| Directory = plugin name | `plugins/<name>/plugin.h` |
+| Function naming | `{name}_{hook}` e.g. `swap_pre_lock` |
+| Context variable | `extern {name}_ctx_t {name}_ctx` |
+| First param | `void *ctx` — opaque context pointer |
+| Second param | `pool_cfg_t *cfg` — pool configuration |
+| No side effects | Plugins read pool state or manage external resources; they must not mutate the pool |
+| Header includes | Must `#include "pool.h"` for `pool_cfg_t` etc. |
 
 ---
 

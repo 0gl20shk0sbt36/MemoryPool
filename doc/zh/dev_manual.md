@@ -21,6 +21,7 @@
 10. [已实施的性能优化](#10-已实施的性能优化)
 11. [潜在问题与改进方向](#11-潜在问题与改进方向)
 12. [查询 API](#12-查询-api)
+13. [插件与 Hook 系统](#13-插件与-hook-系统)
 
 ## 附录
 
@@ -899,6 +900,138 @@ uint32_t sys_handles, sys_pages;
 pool_query_owner_info(&owner, 0, &sys_handles, &sys_pages);
 printf("System owner(0): %u handles, %u pages\n", sys_handles, sys_pages);
 ```
+
+---
+
+## 13. 插件与 Hook 系统
+
+### 13.1 设计理念
+
+插桩（Hook）系统允许在不修改 `pool.c` 的情况下，将外部逻辑注入到池的核心操作路径中。设计目标：
+
+- **零默认开销**：未启用插件时，所有 hook 宏展开为 `do{}while(0)`，编译器完全消除
+- **编译期展开**：启用插件后，hook 展开为直接函数调用（非函数指针），编译器可内联
+- **自动发现**：`configure.py` 扫描 `plugins/` 目录，检测插件实现的 hook，自动生成调用链
+- **纯 C99**：不依赖弱符号、函数指针表或运行时注册
+
+### 13.2 架构
+
+```
+plugins/                        pool_hooks.h
+┌──────────┐                    ┌──────────────────────┐
+│ swap/    │                    │ #ifndef POOL_HOOK_*  │
+│ plugin.h │──→ configure.py ──→│ #define ... do{}...  │← 默认空（零开销）
+│ plugin.c │                    │ #endif               │
+└──────────┘                    └──────────────────────┘
+                                       ↑ 被覆盖
+     pool_plugin_config.h (生成)       │
+     ┌──────────────────────────┐      │
+     │ #undef POOL_HOOK_*       │──────┘
+     │ #define POOL_HOOK_*(...) │
+     │   swap_xxx(&swap_ctx,..) │
+     └──────────────────────────┘
+              ↓ 被 include
+         src/pool.c
+         ┌──────────────────────┐
+         │ POOL_HOOK_PRE_LOCK(  │
+         │   cfg, owner, h);    │──→ swap_pre_lock(&swap_ctx, cfg, owner, h)
+         └──────────────────────┘
+```
+
+### 13.3 全部 Hook 点（14 个）
+
+| 编号 | Hook 宏 | 触发位置 | 参数 |
+|------|---------|----------|------|
+| 1 | `POOL_HOOK_POST_INIT` | `pool_init` 完成 | `cfg` |
+| 2 | `POOL_HOOK_POST_ALLOC` | `pool_alloc_pages` 成功 | `cfg, owner, start, count, handle` |
+| 3 | `POOL_HOOK_PRE_FREE` | `pool_free` 验证后、释放前 | `cfg, owner, handle` |
+| 4 | `POOL_HOOK_POST_FREE` | `pool_free` 释放后 | `cfg, owner, handle` |
+| 5 | `POOL_HOOK_PRE_LOCK` | `pool_lock` 验证后、递增前 | `cfg, owner, handle` |
+| 6 | `POOL_HOOK_POST_LOCK` | `pool_lock` 递增后 | `cfg, owner, handle, addr` |
+| 7 | `POOL_HOOK_PRE_UNLOCK` | `pool_unlock` 递减前 | `cfg, owner, handle` |
+| 8 | `POOL_HOOK_POST_UNLOCK` | `pool_unlock` 递减后 | `cfg, owner, handle` |
+| 9 | `POOL_HOOK_PRE_RESIZE` | `pool_resize` 验证后 | `cfg, owner, h, old, new` |
+| 10 | `POOL_HOOK_POST_RESIZE` | `pool_resize` 完成（4 个路径） | `cfg, owner, h, old, new` |
+| 11 | `POOL_HOOK_PRE_DEFRAG` | `pool_defrag` 开始 | `cfg` |
+| 12 | `POOL_HOOK_DEFRAG_MOVE` | 每次 `data_move` 后 | `cfg, src, dst, cnt, idx` |
+| 13 | `POOL_HOOK_POST_DEFRAG` | `pool_defrag` 完成 | `cfg` |
+| 14 | `POOL_HOOK_PRE_FREE_ALL` | `pool_free_all` 验证后 | `cfg, owner, forced` |
+| 15 | `POOL_HOOK_POST_FREE_ALL` | `pool_free_all` 完成 | `cfg, owner, forced` |
+
+### 13.4 使用流程
+
+**第一步：编写插件**
+
+在 `plugins/<插件名>/plugin.h` 中声明 hook 函数：
+
+```c
+// plugins/my_plugin/plugin.h
+#include "pool.h"
+
+extern int my_ctx;  // 插件自己的上下文
+
+void my_pre_lock(void *ctx, pool_cfg_t *cfg, pool_owner_t *owner, uint32_t handle);
+void my_post_alloc(void *ctx, pool_cfg_t *cfg, pool_owner_t *owner,
+                   uint32_t start, uint32_t count, uint32_t handle);
+```
+
+函数命名必须遵循 `{插件名}_{hook名}` 约定，使 `configure.py` 能自动识别。
+
+**第二步：实现函数**
+
+```c
+// plugins/my_plugin/plugin.c
+#include "plugin.h"
+
+int my_ctx = 0;
+
+void my_pre_lock(void *ctx, pool_cfg_t *cfg, pool_owner_t *owner, uint32_t handle)
+{
+    // 自定义逻辑
+    (void)ctx; (void)cfg; (void)owner; (void)handle;
+}
+// ...
+```
+
+**第三步：构建**
+
+```sh
+cmake -B build
+```
+
+CMake 自动运行 `configure.py`，检测到 `plugins/my_plugin/` 后生成 `pool_plugin_config.h`，定义 `POOL_PLUGINS_ENABLED`，编译插件源文件到 `libpool.a`。
+
+**无插件时**：
+
+```
+Plugins: none (hooks disabled, zero overhead)
+→ pool_plugin_config.h 生成空壳
+→ POOL_PLUGINS_ENABLED 未定义
+→ 所有 POOL_HOOK_* 宏 = do{}while(0)
+→ 编译产物零额外指令
+```
+
+### 13.5 关键 Hook 使用场景
+
+**swap（页交换）**：`PRE_LOCK` 换入 → `PRE_FREE` 刷回脏页 → `DEFRAG_MOVE` 更新索引 → `PRE_UNLOCK` 标记换出候选
+
+**log（日志）**：`POST_ALLOC`、`POST_FREE`、`POST_LOCK`、`POST_UNLOCK` 记录操作
+
+**perf（性能计数器）**：`PRE_*` + `POST_*` 成对使用，测量每个操作耗时
+
+**guard（安全校验）**：`PRE_LOCK` 检查地址合法性，失败时通过全局标志阻止操作（hook 无返回值，通过标志位通信）
+
+### 13.6 插件编写规范
+
+| 规则 | 说明 |
+|------|------|
+| 目录名 = 插件名 | `plugins/<name>/plugin.h` |
+| 函数命名 | `{name}_{hook}` 例如 `swap_pre_lock` |
+| 上下文变量 | `extern {name}_ctx_t {name}_ctx` |
+| 第一个参数 | `void *ctx` — 透传上下文指针 |
+| 第二个参数 | `pool_cfg_t *cfg` — 池配置 |
+| 零依赖 | 插件不修改池状态（只读或操作外部资源） |
+| 头文件 | 必须 `#include "pool.h"` 以使用 `pool_cfg_t` 等类型 |
 
 ---
 
