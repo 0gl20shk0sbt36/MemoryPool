@@ -132,7 +132,7 @@ typedef struct {
     uint32_t page_count;    // 占用页数
     uint16_t lock_count;    // 递归锁定计数
     uint16_t generation;    // 次代数（防 use-after-free）
-} pool_handle_entry_t;      // 每条目 14 字节
+} pool_handle_entry_t;      // 每条目 16 字节（含对齐填充）
 ```
 
 ### 3.5 对齐策略
@@ -1081,6 +1081,63 @@ Plugins: none (hooks disabled, zero overhead)
 | 无副作用 | 插件可读取池状态或管理外部资源，但禁止修改池内部结构 |
 | 头文件依赖 | 必须 `#include "pool.h"` 使用 `pool_cfg_t` 等类型 |
 | 元数据文件 | 每个插件需提供 `plugin.cmake` 供 `configure.py --gen-cmake` 发现 |
+| 字段扩展宏 | `POOL_PLUGIN_{NAME}_{TARGET}_FIELDS` 在 plugin.h 中声明，给核心结构体追加字段 |
+
+### 13.7 字段扩展宏（结构体扩展）
+
+插件可以在编译期为核心结构体（`pool_cfg_t`、`pool_handle_entry_t`、`pool_owner_t`）添加字段。在 `plugin.h` 中定义字段扩展宏即可。
+
+**工作机制**：`configure.py` 扫描每个插件的 `plugin.h`，寻找 `POOL_PLUGIN_{NAME}_{TARGET}_FIELDS` 宏，汇总后生成包装宏（`POOL_CFG_PLUGIN_FIELDS` 等）写入 `pool_plugin_config.h`。`pool.h` 中的 `#ifdef` 守卫将这些宏展开到结构体定义中。
+
+**支持的结构体**：
+
+| 结构体 | plugin.h 中的宏 | 生成的包装宏 |
+|--------|-----------------|-------------|
+| `pool_cfg_t` | `POOL_PLUGIN_{NAME}_CFG_FIELDS` | `POOL_CFG_PLUGIN_FIELDS` |
+| `pool_handle_entry_t` | `POOL_PLUGIN_{NAME}_HANDLE_FIELDS` | `POOL_HANDLE_ENTRY_PLUGIN_FIELDS` |
+| `pool_owner_t` | `POOL_PLUGIN_{NAME}_OWNER_FIELDS` | `POOL_OWNER_PLUGIN_FIELDS` |
+
+**示例** — swap 插件为每个句柄条目添加交换状态：
+
+```c
+// lib/pool_swap/plugins/swap/plugin.h
+
+#define POOL_PLUGIN_SWAP_CFG_FIELDS \
+    void    *swap_backend; \
+    uint32_t swap_block_size;
+
+#define POOL_PLUGIN_SWAP_HANDLE_FIELDS \
+    uint32_t swap_offset;
+```
+
+`configure.py` 运行后，生成的头文件自动包含：
+
+```c
+#define POOL_CFG_PLUGIN_FIELDS \
+    void    *swap_backend; \
+    uint32_t swap_block_size;
+
+#define POOL_HANDLE_ENTRY_PLUGIN_FIELDS \
+    uint32_t swap_offset;
+```
+
+这些宏在 `pool.h` 的结构体定义中展开，`pool_cfg_t` 和 `pool_handle_entry_t` 自动变大。`sizeof` 和 `POOL_META_SIZE` 自动正确计算，无需手动调整。
+
+**初始化强制要求**：任何声明了 `*_FIELDS` 宏的插件**必须**实现 `post_init` hook。`configure.py` 在生成阶段检查：若缺少 `post_init` 则报错退出。扩展字段的初始化（非零默认值、指针设置等）应在 `post_init` 中完成。
+
+```c
+void swap_post_init(void *ctx, pool_cfg_t *cfg) {
+    /* 初始化扩展字段 */
+    cfg->swap_backend = NULL;
+    cfg->swap_block_size = 4096;
+}
+```
+
+**字段类型**：支持所有合法 C99 结构体成员类型 — `uint32_t`、指针、数组、`bool` 等。不支持从插件头文件引入嵌套结构体前向声明（字段宏原始展开到池结构体定义中）。
+
+**多插件协作**：多个插件贡献字段到同一结构体时，按插件名字母序拼接。只要不重新运行 `configure.py`，字段顺序保持稳定。
+
+**零开销**：没有插件声明字段宏时，生成的包装宏不存在，`pool.h` 中的 `#ifdef` 守卫将扩展完全排除 — 结构体大小保持基线值。
 
 ---
 
@@ -1088,9 +1145,9 @@ Plugins: none (hooks disabled, zero overhead)
 
 | 文件 | 行数 | 内容 |
 |------|------|------|
-| include/pool.h | 333 | 公共 API、结构体、枚举、宏 |
-| src/pool.c | 649 | 完整实现 |
-| test/test_pool.c | ~1120 | 29 个单元测试（含 hexdump） |
+| include/pool.h | ~420 | 公共 API、结构体、枚举、宏 |
+| src/pool.c | ~830 | 完整实现 |
+| test/test_pool.c | ~1400 | 45 个单元测试（含 hexdump） |
 | CMakeLists.txt | 24 | CMake 双模式构建 |
 | test/CMakeLists.txt | 15 | 测试子目录 |
 
@@ -1171,7 +1228,7 @@ Plugins: none (hooks disabled, zero overhead)
 ```
 安全性:    ✅ 无已知可利用漏洞
 健壮性:    ✅ 参数校验完整，错误码统一
-边界条件:  ✅ 主要路径已覆盖（42 测试）
+边界条件:  ✅ 主要路径已覆盖（45 测试）
 性能:      ✅ 位图批量/字节跳过/按字搬移/hint 搜索
 内存安全:  ✅ 零动态分配，无悬垂指针（handle 机制保护）
 线程安全:  ⬜ 单线程 MCU 设计，共享池需额外保护（已知限制）

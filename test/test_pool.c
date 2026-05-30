@@ -1281,6 +1281,123 @@ TEST(defrag_mixed_blocks)
     CHECK(test_cfg.handle_table[i4].page_start == 8, "h4 moves to page 8");
 }
 
+/* --- 锁定溢出 --- */
+
+/* 锁定计数溢出：lock_count 达到 65535 后再 lock → ERR_OVERFLOW */
+TEST(lock_overflow)
+{
+    setup_pool();
+    pool_owner_t owner;
+    pool_user_pack(&owner, &test_cfg);
+
+    uint32_t handle;
+    CHECK_EQ(pool_alloc_pages(&owner, 1, &handle), POOL_ALLOC_OK, "alloc");
+
+    /* 直接篡改 lock_count 为 0xFFFF（用于模拟极限状态） */
+    uint32_t idx = handle & test_cfg.handle_index_mask;
+    test_cfg.handle_table[idx].lock_count = 0xFFFFu;
+
+    void *addr;
+    CHECK_EQ(pool_lock(&owner, handle, &addr), POOL_LOCK_ERR_OVERFLOW, "overflow");
+
+    /* 恢复并验证正常操作 */
+    test_cfg.handle_table[idx].lock_count = 0;
+    CHECK_EQ(pool_lock(&owner, handle, &addr), POOL_LOCK_OK, "recover lock ok");
+    pool_unlock(&owner, handle);
+    pool_free(&owner, handle);
+}
+
+/* --- 查询 API --- */
+
+/* 查询空闲页数 */
+TEST(query_free_pages)
+{
+    setup_pool();
+    pool_owner_t owner;
+    pool_user_pack(&owner, &test_cfg);
+
+    uint32_t free, alloced;
+    /* 全部空闲 */
+    CHECK_EQ(pool_query_free_pages(&owner, &free), POOL_QUERY_OK, "all free");
+    CHECK_EQ(free, TEST_PAGE_COUNT, "free = page_count");
+
+    /* 分配后 */
+    uint32_t h1, h2;
+    pool_alloc_pages(&owner, 3, &h1);
+    pool_alloc_pages(&owner, 5, &h2);
+    CHECK_EQ(pool_query_free_pages(&owner, &free), POOL_QUERY_OK, "after alloc");
+    alloced = 3 + 5;
+    CHECK(free == TEST_PAGE_COUNT - alloced, "free matches");
+
+    /* NULL 检查 */
+    CHECK_EQ(pool_query_free_pages(NULL, &free), POOL_QUERY_ERR_NULL, "null owner");
+}
+
+/* 查询句柄占用大小 */
+TEST(query_handle_size)
+{
+    setup_pool();
+    pool_owner_t owner;
+    pool_user_pack(&owner, &test_cfg);
+
+    uint32_t handle;
+    pool_alloc_pages(&owner, 4, &handle);
+
+    uint32_t pages, bytes;
+    CHECK_EQ(pool_query_handle_size(&owner, handle, &pages, &bytes), POOL_QUERY_OK, "ok");
+    CHECK_EQ(pages, 4u, "pages=4");
+    CHECK_EQ(bytes, 4u * TEST_PAGE_SIZE, "bytes match");
+
+    /* 可传 NULL 跳过返回 */
+    CHECK_EQ(pool_query_handle_size(&owner, handle, NULL, &bytes), POOL_QUERY_OK, "pages=NULL");
+    CHECK_EQ(bytes, 4u * TEST_PAGE_SIZE, "bytes still ok");
+    CHECK_EQ(pool_query_handle_size(&owner, handle, &pages, NULL), POOL_QUERY_OK, "bytes=NULL");
+    CHECK_EQ(pages, 4u, "pages still ok");
+
+    /* 无效句柄 */
+    CHECK_EQ(pool_query_handle_size(&owner, 0xDEADBEEF, &pages, NULL),
+             POOL_QUERY_ERR_INVALID, "invalid handle");
+
+    /* 属主不匹配 */
+    pool_owner_t other;
+    pool_user_pack(&other, &test_cfg);
+    CHECK_EQ(pool_query_handle_size(&other, handle, &pages, NULL),
+             POOL_QUERY_ERR_OWNER, "wrong owner");
+}
+
+/* 查询指定使用者占用的资源 */
+TEST(query_owner_info)
+{
+    setup_pool();
+    pool_owner_t a, b;
+    pool_user_pack(&a, &test_cfg);
+    pool_user_pack(&b, &test_cfg);
+
+    uint32_t ha1, ha2, hb1;
+    pool_alloc_pages(&a, 3, &ha1);
+    pool_alloc_pages(&a, 5, &ha2);
+    pool_alloc_pages(&b, 7, &hb1);
+
+    uint32_t handles, pages;
+    /* 查询自身 */
+    CHECK_EQ(pool_query_owner_info(&a, a.owner_id, &handles, &pages), POOL_QUERY_OK, "a self");
+    CHECK_EQ(handles, 2u, "a handles=2");
+    CHECK_EQ(pages, 8u, "a pages=8 (3+5)");
+
+    /* 查询另一使用者 */
+    CHECK_EQ(pool_query_owner_info(&a, b.owner_id, &handles, &pages), POOL_QUERY_OK, "query b");
+    CHECK_EQ(handles, 1u, "b handles=1");
+    CHECK_EQ(pages, 7u, "b pages=7");
+
+    /* 可传 NULL */
+    CHECK_EQ(pool_query_owner_info(&a, b.owner_id, NULL, &pages), POOL_QUERY_OK, "handles=NULL");
+
+    /* 不存在的属主 */
+    CHECK_EQ(pool_query_owner_info(&a, 42, &handles, &pages), POOL_QUERY_OK, "unknown owner");
+    CHECK_EQ(handles, 0u, "handles=0");
+    CHECK_EQ(pages, 0u, "pages=0");
+}
+
 /*===========================================================================
  * main
  *===========================================================================*/
@@ -1342,6 +1459,12 @@ int main(void)
     RUN(multi_owner_cross_reuse);
     RUN(generation_wrap);
     RUN(defrag_mixed_blocks);
+
+    RUN(lock_overflow);
+
+    RUN(query_free_pages);
+    RUN(query_handle_size);
+    RUN(query_owner_info);
 
     printf("\n--- %d failures ---\n", g_failures);
     return g_failures ? 1 : 0;

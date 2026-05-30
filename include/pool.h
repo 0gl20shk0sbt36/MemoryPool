@@ -27,6 +27,15 @@
 #include <stddef.h>
 #include <stdbool.h>
 
+/*===========================================================================
+ * 插件字段扩展 — 编译期零开销
+ *===========================================================================*/
+#ifdef POOL_PLUGINS_ENABLED
+#define POOL_FIELD_DEFS_ONLY
+#include "pool_plugin_config.h"
+#undef POOL_FIELD_DEFS_ONLY
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -85,6 +94,9 @@ typedef struct {
     uint32_t page_count;    /**< 占用页数 */
     uint16_t lock_count;    /**< 锁定计数 */
     uint16_t generation;    /**< 次代数，用于句柄验证 */
+#ifdef POOL_HANDLE_ENTRY_PLUGIN_FIELDS
+    POOL_HANDLE_ENTRY_PLUGIN_FIELDS
+#endif
 } pool_handle_entry_t;
 
 /** @brief 池配置 */
@@ -106,12 +118,18 @@ typedef struct {
     pool_handle_entry_t *handle_table; /**< 句柄表指针 */
     uint32_t  handle_index_mask;/**< 句柄索引掩码 */
     uint32_t  handle_index_bits;/**< 句柄索引位数 */
+#ifdef POOL_CFG_PLUGIN_FIELDS
+    POOL_CFG_PLUGIN_FIELDS
+#endif
 } pool_cfg_t;
 
 /** @brief 使用者上下文（打包结构体，作为所有操作的第一个参数） */
 typedef struct {
     pool_cfg_t *cfg;        /**< 指向池配置的指针 */
     uint16_t    owner_id;   /**< 使用者ID */
+#ifdef POOL_OWNER_PLUGIN_FIELDS
+    POOL_OWNER_PLUGIN_FIELDS
+#endif
 } pool_owner_t;
 
 /*===========================================================================

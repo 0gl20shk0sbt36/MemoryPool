@@ -75,7 +75,7 @@ Offset 4:    bitmap[ceil(N/8)]       (1 bit per page)
              alignment pad (0~1 byte, to 2-byte boundary)
              page_owner[N]           (2 bytes each, handle index or 0xFFFF)
              alignment pad (0~3 bytes, to 4-byte boundary)
-             handle_table[H]         (14 bytes each)
+              handle_table[H]           (16 bytes each)
 ```
 
 The init magic at offset 0 prevents accidental re-initialization.
@@ -387,6 +387,63 @@ Plugins: none (hooks disabled, zero overhead)
 | No side effects | Plugins read pool state or manage external resources; they must not mutate the pool |
 | Header includes | Must `#include "pool.h"` for `pool_cfg_t` etc. |
 | Metadata | `plugins/<plugin>/plugin.cmake` is required for `configure.py --gen-cmake` discovery |
+| Field extension macros | `POOL_PLUGIN_{NAME}_{TARGET}_FIELDS` in plugin.h for struct augmentation |
+
+### 13.7 Field Extension Macros (Struct Augmentation)
+
+Plugins can add fields to the core pool structs (`pool_cfg_t`, `pool_handle_entry_t`, `pool_owner_t`) at compile time. This is done by defining field extension macros in `plugin.h`.
+
+**Mechanism**: `configure.py` scans each plugin's `plugin.h` for macros named `POOL_PLUGIN_{NAME}_{TARGET}_FIELDS`, aggregates them, and generates wrapper macros (`POOL_CFG_PLUGIN_FIELDS`, `POOL_HANDLE_ENTRY_PLUGIN_FIELDS`, `POOL_OWNER_PLUGIN_FIELDS`) in `pool_plugin_config.h`. These are inserted into the struct definitions via `#ifdef` guards in `pool.h`.
+
+**Target structs**:
+
+| Target | Macro in plugin.h | Generated wrapper |
+|--------|-------------------|-------------------|
+| `pool_cfg_t` | `POOL_PLUGIN_{NAME}_CFG_FIELDS` | `POOL_CFG_PLUGIN_FIELDS` |
+| `pool_handle_entry_t` | `POOL_PLUGIN_{NAME}_HANDLE_FIELDS` | `POOL_HANDLE_ENTRY_PLUGIN_FIELDS` |
+| `pool_owner_t` | `POOL_PLUGIN_{NAME}_OWNER_FIELDS` | `POOL_OWNER_PLUGIN_FIELDS` |
+
+**Example** — swap plugin adding per-handle state:
+
+```c
+// lib/pool_swap/plugins/swap/plugin.h
+
+#define POOL_PLUGIN_SWAP_CFG_FIELDS \
+    void    *swap_backend; \
+    uint32_t swap_block_size;
+
+#define POOL_PLUGIN_SWAP_HANDLE_FIELDS \
+    uint32_t swap_offset;
+```
+
+After `configure.py` runs, the generated header includes:
+
+```c
+#define POOL_CFG_PLUGIN_FIELDS \
+    void    *swap_backend; \
+    uint32_t swap_block_size;
+
+#define POOL_HANDLE_ENTRY_PLUGIN_FIELDS \
+    uint32_t swap_offset;
+```
+
+These are expanded inside the struct definitions in `pool.h`, so `pool_cfg_t` and `pool_handle_entry_t` automatically grow. `sizeof` and `POOL_META_SIZE` adapt correctly without manual changes.
+
+**Initialization requirement**: any plugin that defines `*_FIELDS` macros **must** implement the `post_init` hook. `configure.py` validates this at generation time and will abort with an error if `post_init` is missing. The `post_init` hook is where extension fields should be initialized (non-zero defaults, pointer setup, etc.).
+
+```c
+void swap_post_init(void *ctx, pool_cfg_t *cfg) {
+    /* Initialize extension fields */
+    cfg->swap_backend = NULL;
+    cfg->swap_block_size = 4096;
+}
+```
+
+**Field types**: all valid C99 struct member types are supported — `uint32_t`, pointers, arrays, `bool`, etc. No nested struct forward-declarations from plugin headers (the field macros are expanded raw inside the pool struct definition).
+
+**Multiple plugins**: when multiple plugins contribute fields to the same struct, their declarations are concatenated in alphabetical plugin name order. Field ordering across plugins is stable as long as `configure.py` is not re-run.
+
+**Zero overhead**: when no plugin defines field macros, the generated wrappers are absent, and the `#ifdef` guards in `pool.h` remove the extension entirely — struct sizes remain at their baseline values.
 
 ---
 
@@ -396,7 +453,7 @@ Plugins: none (hooks disabled, zero overhead)
 |------|-------|---------|
 | include/pool.h | ~340 | Public API, structs, enums, macros |
 | src/pool.c | ~780 | Full implementation |
-| test/test_pool.c | ~1350 | 42 unit tests (POOL_DEBUG hexdump) |
+| test/test_pool.c | ~1350 | 45 unit tests (POOL_DEBUG hexdump) |
 | CMakeLists.txt | 24 | Dual-mode CMake build |
 | test/CMakeLists.txt | 15 | Test subdirectory |
 | doc/zh/ | | Chinese manuals |
@@ -412,7 +469,7 @@ Plugins: none (hooks disabled, zero overhead)
 | Metadata integrity | ✅ Guarded | Re-init magic, overlap check, generation validation |
 | Memory safety | ✅ | Zero dynamic allocation, no dangling pointers (handle system) |
 | Thread safety | ⬜ | Single-threaded design (documented) |
-| Code quality | ✅ | C99, -Wall -Wextra -Wpedantic: zero warnings, 42 tests pass |
+| Code quality | ✅ | C99, -Wall -Wextra -Wpedantic: zero warnings, 45 tests pass |
 
 ---
 
